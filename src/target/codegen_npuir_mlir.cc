@@ -84,6 +84,7 @@
 
 #include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/BuiltinAttributeInterfaces.h"
 
 using namespace mlir;
 
@@ -1463,27 +1464,30 @@ mlir::Value CodeGenTileLangNPUIRMLIR::GenMemrefLoadFromRegion(const BufferLoadNo
 
 // 768
 
-Value broadcast(Value input, DenseI64ArrayAttr dims, OpBuilder &builder){
+Value broadcast(Value input, Value output, DenseI64ArrayAttr dims, OpBuilder &builder){
   auto inputType = input.getType();
-  std::cerr<<"BroadCast Output:\n"; 
-  inputType.dump();
-
-  if(auto float_type = mlir::dyn_cast<FloatType>(inputType)){
-    auto loc = builder.getUnknownLoc();
-    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, RankedTensorType::get(dims, float_type), ValueRange{});
-    return builder.create<mlir::linalg::FillOp>(loc, input, emptyTensor).getResult(0);
+  auto loc = builder.getUnknownLoc();
+  auto output_type = mlir::dyn_cast<MemRefType>(output.getType());
+  ArrayRef<int64_t> outputShape = output_type.getShape();
+  SmallVector<Value> dynamicSizes = ValueRange{};
+  for (int64_t i = 0; i < output_type.getRank(); i++){
+      if(ShapedType::isDynamic(outputShape[i])){
+          Value dimSize = builder.create<memref::DimOp>(loc, output, i);
+          dynamicSizes.push_back(dimSize);
+      }
   }
-  if(auto float_type = mlir::dyn_cast<IntegerType>(inputType)){
-    auto loc = builder.getUnknownLoc();
-    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, RankedTensorType::get(dims, float_type), ValueRange{});
-    return builder.create<mlir::linalg::FillOp>(loc, input, emptyTensor).getResult(0);
+
+  if(dims.empty()){
+    return input;
+  }
+  if(inputType.isa<FloatType, IntegerType>()){
+    Value emptyMemref = builder.create<memref::AllocOp>(loc, MemRefType::get(outputShape, inputType), dynamicSizes);
+    builder.create<mlir::linalg::FillOp>(loc, input, emptyMemref);
+    return emptyMemref;
   }
   if(auto type = mlir::dyn_cast<MemRefType>(inputType)){
+    
     ArrayRef<int64_t> shape = type.getShape();
-    SmallVector<int64_t> unitDims;
-    for (int64_t i = 0; i < shape.size(); i++){
-        if(shape[i] == 1) unitDims.push_back(i);
-    }
 
     SmallVector<ReassociationIndices> reassoc;
     ReassociationIndices currentGroup;
@@ -1492,80 +1496,33 @@ Value broadcast(Value input, DenseI64ArrayAttr dims, OpBuilder &builder){
     for (int64_t i = 0; i < shape.size(); i++){
         currentGroup.push_back(i);
 
-        if(llvm::find(unitDims, i) == unitDims.end()){
+        if(llvm::find(dims.asArrayRef(), i) != dims.asArrayRef().end()){
             reassoc.push_back(currentGroup);
             currentGroup.clear();
         }
     }
-
-    SmallVector<int64_t> outputShape;
-    for (int64_t i = 0; i < type.getRank(); i++){
-        if(llvm::find(unitDims, i) == unitDims.end()){
-            outputShape.push_back(type.getDimSize(i));
-        }
+    if (!currentGroup.empty()) {
+        reassoc.push_back(currentGroup);
     }
-
-    auto resultType = mlir::MemRefType::get(outputShape, type.getElementType());
-    auto loc = builder.getUnknownLoc();
-    builder.create<memref::CollapseShapeOp>(loc, resultType, input, reassoc);
-
-    
-    Value initTensor = builder.create<tensor::EmptyOp>(loc, resultType, ValueRange{});
-    return builder.create<mlir::linalg::BroadcastOp>(loc, input, initTensor, dims).getResult()[0];
+    if (reassoc.empty()) {
+      reassoc.push_back({0}); 
   }
-
-   if(auto type = mlir::dyn_cast<RankedTensorType>(inputType)){
-    ArrayRef<int64_t> shape = type.getShape();
-    SmallVector<int64_t> unitDims;
-    for (int64_t i = 0; i < shape.size(); i++){
-        if(shape[i] == 1) unitDims.push_back(i);
-    }
-
-    SmallVector<ReassociationIndices> reassoc;
-    ReassociationIndices currentGroup;
-    
-
-    for (int64_t i = 0; i < shape.size(); i++){
-        currentGroup.push_back(i);
-
-        if(llvm::find(unitDims, i) == unitDims.end()){
-            reassoc.push_back(currentGroup);
-            currentGroup.clear();
-        }
-    }
-
-    SmallVector<int64_t> outputShape;
-    for (int64_t i = 0; i < type.getRank(); i++){
-        if(llvm::find(unitDims, i) == unitDims.end()){
-            outputShape.push_back(type.getDimSize(i));
-        }
-    }
-
-    auto resultType = mlir::RankedTensorType::get(outputShape, type.getElementType());
-    auto loc = builder.getUnknownLoc();
-    builder.create<memref::CollapseShapeOp>(loc, resultType, input, reassoc);
-
-    
-    Value initTensor = builder.create<tensor::EmptyOp>(loc, resultType, ValueRange{});
-    return builder.create<mlir::linalg::BroadcastOp>(loc, input, initTensor, dims).getResult()[0];
+    auto resultType = mlir::MemRefType::get(outputShape, type.getElementType(), MemRefLayoutAttrInterface{}, output_type.getMemorySpace());
+    auto collapsedMemref = builder.create<memref::CollapseShapeOp>(loc, input, reassoc);
+    Value initMemref = builder.create<memref::AllocOp>(loc, resultType, dynamicSizes);
+    builder.create<mlir::linalg::BroadcastOp>(loc, collapsedMemref, initMemref, dims);
+    return initMemref;
   }
 
 
   return input;
 }
 
-Value transpose(Value input, DenseI64ArrayAttr dims, OpBuilder &builder){
+Value transpose(Value input, Value output, DenseI64ArrayAttr dims, OpBuilder &builder){
     auto inputType = input.getType();
-    if(auto tensor_type = mlir::dyn_cast<RankedTensorType>(inputType)){
-        ArrayRef<int64_t> inputShape = tensor_type.getShape();
-        SmallVector<int64_t> outputShape;
-        for (int64_t i = 0; i < dims.size(); i++){
-            outputShape.push_back(inputShape[dims[i]]);
-        }
-        auto loc = builder.getUnknownLoc();
-        auto resultType = mlir::RankedTensorType::get(outputShape, tensor_type.getElementType());
-        Value initTensor = builder.create<tensor::EmptyOp>(loc, resultType, ValueRange{});
-        return builder.create<mlir::linalg::TransposeOp>(loc, input, initTensor, dims).getResult()[0];
+    auto output_type = mlir::dyn_cast<MemRefType>(output.getType());
+    if(dims.empty()){
+      return input;
     }
     if(auto memref_type = mlir::dyn_cast<MemRefType>(inputType)){
         ArrayRef<int64_t> inputShape = memref_type.getShape();
@@ -1574,9 +1531,10 @@ Value transpose(Value input, DenseI64ArrayAttr dims, OpBuilder &builder){
             outputShape.push_back(inputShape[dims[i]]);
         }
         auto loc = builder.getUnknownLoc();
-        auto resultType = mlir::MemRefType::get(outputShape, memref_type.getElementType());
-        Value initTensor = builder.create<tensor::EmptyOp>(loc, resultType, ValueRange{});
-        return builder.create<mlir::linalg::TransposeOp>(loc, input, initTensor, dims).getResult()[0];
+        auto resultType = mlir::MemRefType::get(outputShape, memref_type.getElementType(), MemRefLayoutAttrInterface{}, output_type.getMemorySpace());
+        Value initMemref = builder.create<memref::AllocOp>(loc, resultType, ValueRange{});
+        builder.create<mlir::linalg::TransposeOp>(loc, input, initMemref, dims);
+        return initMemref;
     }
 }
 
@@ -1635,19 +1593,20 @@ void CodeGenTileLangNPUIRMLIR::CreateHIVMBinaryVectorOp(const CallNode *op) {
       getBroadcastDim(buffer_shape0, buffer_shape1);
   mlir::DenseI64ArrayAttr broadcast = builder.getDenseI64ArrayAttr(dims);
 
-  //
-  std::cerr<<"Broadcast Output:\n"; 
 
-  tvm::codegen::broadcast(src0, broadcast, builder).dump();
-
-  std::cerr<<"Transpose Output:\n"; 
-
-  tvm::codegen::transpose(src0, transpose, builder).dump();
 
 
   // Create hivm::op
   auto loc = builder.getUnknownLoc();
-  if constexpr (std::is_same_v<T, mlir::hivm::VCmpOp>) {
+  if constexpr (std::is_same_v<T, mlir::linalg::AddOp>){
+    //src0 = tvm::codegen::transpose(src0, dst, transpose, builder);
+    src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
+    //src1 = tvm::codegen::transpose(src1, dst, transpose, builder);
+    src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+    builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
+                      mlir::ValueRange{dst});
+  }
+  else if constexpr (std::is_same_v<T, mlir::hivm::VCmpOp>) {
     mlir::hivm::CompareMode mode =
         COMPARE_MODE[op->args[3].as<StringImm>().value()->value];
     auto cmp_attr =
@@ -2036,7 +1995,7 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.ascend_copy"))) {
     AscendCopyCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_add"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VAddOp>(op);
+    CreateHIVMBinaryVectorOp<mlir::linalg::AddOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_exp"))) {
     UnaryVecOpCodegen<tvm::tl::NpuirExp, mlir::hivm::VExpOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_ln"))) {

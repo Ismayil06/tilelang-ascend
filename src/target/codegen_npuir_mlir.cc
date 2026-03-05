@@ -1486,9 +1486,8 @@ Value broadcast(Value input, Value output, DenseI64ArrayAttr dims, OpBuilder &bu
     return emptyMemref;
   }
   if(auto type = mlir::dyn_cast<MemRefType>(inputType)){
-    
     ArrayRef<int64_t> shape = type.getShape();
-
+    if(shape[dims[0]] != 1) return input;
     SmallVector<ReassociationIndices> reassoc;
     ReassociationIndices currentGroup;
     
@@ -1598,15 +1597,8 @@ void CodeGenTileLangNPUIRMLIR::CreateHIVMBinaryVectorOp(const CallNode *op) {
 
   // Create hivm::op
   auto loc = builder.getUnknownLoc();
-  if constexpr (std::is_same_v<T, mlir::linalg::AddOp>){
-    //src0 = tvm::codegen::transpose(src0, dst, transpose, builder);
-    src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
-    //src1 = tvm::codegen::transpose(src1, dst, transpose, builder);
-    src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
-    builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
-                      mlir::ValueRange{dst});
-  }
-  else if constexpr (std::is_same_v<T, mlir::hivm::VCmpOp>) {
+
+  if constexpr (std::is_same_v<T, mlir::hivm::VCmpOp>) {
     mlir::hivm::CompareMode mode =
         COMPARE_MODE[op->args[3].as<StringImm>().value()->value];
     auto cmp_attr =
@@ -1623,8 +1615,12 @@ void CodeGenTileLangNPUIRMLIR::CreateHIVMBinaryVectorOp(const CallNode *op) {
     builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
                       mlir::ValueRange{dst}, round_attr, transpose, broadcast);
   } else {
-    builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
-                      mlir::ValueRange{dst}, transpose, broadcast);
+        //src0 = tvm::codegen::transpose(src0, dst, transpose, builder);
+        src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
+        //src1 = tvm::codegen::transpose(src1, dst, transpose, builder);
+        src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+        builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
+                        mlir::ValueRange{dst});
   }
 }
 
@@ -2027,15 +2023,15 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_bitcast"))) {
     BitcastCodegen(op);
   }  else if (op->op.same_as(Op::Get("tl.npuir_div"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VDivOp>(op);
+    CreateHIVMBinaryVectorOp<mlir::linalg::DivOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_mul"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VMulOp>(op);
+    CreateHIVMBinaryVectorOp<mlir::linalg::MulOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_sub"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VSubOp>(op);
+    CreateHIVMBinaryVectorOp<mlir::linalg::SubOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_max"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VMaxOp>(op);
+    CreateHIVMBinaryVectorOp<mlir::linalg::MaxOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_min"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VMinOp>(op);
+    CreateHIVMBinaryVectorOp<mlir::linalg::MinOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_or"))) {
     CreateHIVMBinaryVectorOp<mlir::hivm::VOrOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_and"))) {

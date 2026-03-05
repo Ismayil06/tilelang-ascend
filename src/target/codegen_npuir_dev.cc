@@ -2363,22 +2363,23 @@ void CodeGenTileLangNPUIRDEV::DebugPrintCodegen(const CallNode *op) {
 //  - scale each term with corresponding constant
 //  - accumulate terms using hivm::Vadd
 //  - store the final result into destination vector
-//  - all intermediate results are lowered to vector operations on memref subviews
+//  - all intermediate results are lowered to tensor operations
 void CodeGenTileLangNPUIRDEV::VcosCodegen(const CallNode *op) {
   tvm::tl::NpuirVCos npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
 
   llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i=0; i < n_srcs; i++) {
-    Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
+  for (size_t i = 0; i < n_srcs; i++) {
+    Value src = GenExtractSliceFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
     srcs.push_back(src);
   }
-  mlir::ValueRange srcs_vr(srcs);
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  Value dstVal = GetVarValue(npuirop.dst);
+  mlir::Type tensorType = dstVal.getType();
+  mlir::TypeRange resultType(&tensorType, 1);
 
-  auto srcType = srcs_vr[0].getType().cast<MemRefType>();
-  mlir::Type elementType = srcType.getElementType();
+  auto srcTensorType = srcs[0].getType().cast<mlir::RankedTensorType>();
+  mlir::Type elementType = srcTensorType.getElementType();
   Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 1.0f));
   Value minusHalf = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -0.5f));
   Value twentyFour = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 24.0f));
@@ -2394,17 +2395,21 @@ void CodeGenTileLangNPUIRDEV::VcosCodegen(const CallNode *op) {
     Value x6 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
     Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, x2}, ValueRange{x4});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, x4}, ValueRange{x6});
+    // Compute x^2, x^4, x^6
+    x2 = builder.create<mlir::hivm::VMulOp>(loc, src.getType(), ValueRange{src, src}, ValueRange{x2})->getResult(0);
+    x4 = builder.create<mlir::hivm::VMulOp>(loc, x2.getType(), ValueRange{x2, x2}, ValueRange{x4})->getResult(0);
+    x6 = builder.create<mlir::hivm::VMulOp>(loc, x2.getType(), ValueRange{x2, x4}, ValueRange{x6})->getResult(0);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, minusHalf}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x4, oneOver24}, ValueRange{x4});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x6, minusOneOver720}, ValueRange{x6});
+    // Scale each term: -1/2*x^2, 1/24*x^4, -1/720*x^6
+    x2 = builder.create<mlir::hivm::VMulOp>(loc, x2.getType(), ValueRange{x2, minusHalf}, ValueRange{x2})->getResult(0);
+    x4 = builder.create<mlir::hivm::VMulOp>(loc, x4.getType(), ValueRange{x4, oneOver24}, ValueRange{x4})->getResult(0);
+    x6 = builder.create<mlir::hivm::VMulOp>(loc, x6.getType(), ValueRange{x6, minusOneOver720}, ValueRange{x6})->getResult(0);
 
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x2, one}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x4, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x6, tmp}, ValueRange{dst});
+    // Accumulate: 1 + (-1/2*x^2) + (1/24*x^4) + (-1/720*x^6)
+    tmp = builder.create<mlir::hivm::VAddOp>(loc, x2.getType(), ValueRange{x2, one}, ValueRange{tmp})->getResult(0);
+    tmp = builder.create<mlir::hivm::VAddOp>(loc, tmp.getType(), ValueRange{x4, tmp}, ValueRange{tmp})->getResult(0);
+    Value result = builder.create<mlir::hivm::VAddOp>(loc, dstVal.getType(), ValueRange{x6, tmp}, ValueRange{dstVal})->getResult(0);
+    SetVarValue(npuirop.dst, result);
   }
 }
 
@@ -2421,22 +2426,21 @@ void CodeGenTileLangNPUIRDEV::VcosCodegen(const CallNode *op) {
 //   - scale each term with corresponding coefficient (-1/6, 1/120, -1/5040)
 //   - accumulate terms using hivm::VAdd
 //   - store the final result into destination vector
-//   - all intermediate results are lowered to vector operations on memref subviews
+//   - all intermediate results are lowered to tensor operations
 void CodeGenTileLangNPUIRDEV::VsinCodegen(const CallNode *op) {
   tvm::tl::NpuirVSin npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
 
   llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i=0; i < n_srcs; i++) {
-    Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
+  for (size_t i = 0; i < n_srcs; i++) {
+    Value src = GenExtractSliceFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
     srcs.push_back(src);
   }
-  mlir::ValueRange srcs_vr(srcs);
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  Value dstVal = GetVarValue(npuirop.dst);
 
-  auto srcType = srcs_vr[0].getType().cast<MemRefType>();
-  mlir::Type elementType = srcType.getElementType();
+  auto srcTensorType = srcs[0].getType().cast<mlir::RankedTensorType>();
+  mlir::Type elementType = srcTensorType.getElementType();
   Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 1.0f));
   Value minusOne = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -1.0f));
   Value six = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 6.0f));
@@ -2451,21 +2455,25 @@ void CodeGenTileLangNPUIRDEV::VsinCodegen(const CallNode *op) {
     Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
     Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
     Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);    
+    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
     Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2}, ValueRange{x7});
+    // Compute x^2, x^3, x^5, x^7
+    x2 = builder.create<mlir::hivm::VMulOp>(loc, src.getType(), ValueRange{src, src}, ValueRange{x2})->getResult(0);
+    x3 = builder.create<mlir::hivm::VMulOp>(loc, x2.getType(), ValueRange{x2, src}, ValueRange{x3})->getResult(0);
+    x5 = builder.create<mlir::hivm::VMulOp>(loc, x3.getType(), ValueRange{x3, x2}, ValueRange{x5})->getResult(0);
+    x7 = builder.create<mlir::hivm::VMulOp>(loc, x5.getType(), ValueRange{x5, x2}, ValueRange{x7})->getResult(0);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, minusOneOver6}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, oneOver120}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x7, minusOneOver5040}, ValueRange{x7});
+    // Scale each term: -1/6*x^3, 1/120*x^5, -1/5040*x^7
+    x3 = builder.create<mlir::hivm::VMulOp>(loc, x3.getType(), ValueRange{x3, minusOneOver6}, ValueRange{x3})->getResult(0);
+    x5 = builder.create<mlir::hivm::VMulOp>(loc, x5.getType(), ValueRange{x5, oneOver120}, ValueRange{x5})->getResult(0);
+    x7 = builder.create<mlir::hivm::VMulOp>(loc, x7.getType(), ValueRange{x7, minusOneOver5040}, ValueRange{x7})->getResult(0);
 
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp}, ValueRange{dst});
+    // Accumulate: x + (-1/6*x^3) + (1/120*x^5) + (-1/5040*x^7)
+    tmp = builder.create<mlir::hivm::VAddOp>(loc, src.getType(), ValueRange{src, x3}, ValueRange{tmp})->getResult(0);
+    tmp = builder.create<mlir::hivm::VAddOp>(loc, tmp.getType(), ValueRange{x5, tmp}, ValueRange{tmp})->getResult(0);
+    Value result = builder.create<mlir::hivm::VAddOp>(loc, dstVal.getType(), ValueRange{x7, tmp}, ValueRange{dstVal})->getResult(0);
+    SetVarValue(npuirop.dst, result);
   }
 }
 

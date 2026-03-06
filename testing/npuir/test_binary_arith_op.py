@@ -12,18 +12,17 @@ dtype = "float16"
 
 def binary_kernel(M, N, block_M, op, dtype="float16"):
     grid_M = (M + block_M - 1) // block_M
-    K = T.symbolic("K")
     @T.prim_func
     def main(
-        A: T.Tensor((K,1), dtype),
-        B: T.Tensor((K,N), dtype),
-        Out: T.Tensor((K,N), dtype),
+        A: T.Tensor((N,M), dtype),
+        B: T.Tensor((N,1), dtype),
+        Out: T.Tensor((N,M), dtype),
     ):
         with T.Kernel(grid_M, is_npu=True) as (bx, _):
             # UB buffers
-            acc_A = T.alloc_shared((K,1), dtype)
-            acc_B = T.alloc_shared((K,N), dtype)
-            out_ub = T.alloc_shared((K,N), dtype)
+            acc_A = T.alloc_shared((N,M), dtype)
+            acc_B = T.alloc_shared((N,1), dtype)
+            out_ub = T.alloc_shared((N,M), dtype)
 
             # GM -> UB
             T.copy(A, acc_A)
@@ -99,8 +98,7 @@ def reference(A, B, M, op):
     return ref
 
 def main():
-    M, N = 4, 64
-    block_M = 4
+    
 
     # A = torch.randn(N, dtype=torch.float16).npu()
     # B = torch.randn(N, dtype=torch.float16).npu()
@@ -175,5 +173,5 @@ def main():
     print("================================")
 
 if __name__ == "__main__":
-    print("Running in developer mode")
+
     main()

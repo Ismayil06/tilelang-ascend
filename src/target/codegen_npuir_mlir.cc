@@ -85,6 +85,7 @@
 #include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinAttributeInterfaces.h"
+#include "mlir/IR/ValueRange.h"
 
 using namespace mlir;
 
@@ -1077,21 +1078,51 @@ void CodeGenTileLangNPUIRMLIR::VbrcCodegen(const CallNode *op) {
     } else {
       src = MakeValue(npuirop.in);
     }
+
+    Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+
+    auto outMemref = llvm::dyn_cast<TypedValue<MemRefType>>(dst);
+    auto outBufferShape = outMemref.getType().getShape();
+    Value emptyMemref = builder.create<memref::AllocOp>(builder.getUnknownLoc(), MemRefType::get(outBufferShape, src.getType()), ValueRange{});
+    builder.create<mlir::linalg::FillOp>(builder.getUnknownLoc(), src, emptyMemref);
+
   } else {
     src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
     auto srcMemref = llvm::dyn_cast<TypedValue<MemRefType>>(src);
     inBufferShape = srcMemref.getType().getShape();
-  }
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  auto broadcastDimAttr = builder.getDenseI64ArrayAttr({});
-  if (!inBufferShape.empty()) {
+
+    Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+    auto broadcastDimAttr = builder.getDenseI64ArrayAttr({});
     auto outMemref = llvm::dyn_cast<TypedValue<MemRefType>>(dst);
     auto outBufferShape = outMemref.getType().getShape();
     auto broadcastDim = getBroadcastDim(npuirop.src->shape, npuirop.dst->shape);
     broadcastDimAttr = builder.getDenseI64ArrayAttr(broadcastDim);
+    
+    SmallVector<ReassociationIndices> reassoc;
+    ReassociationIndices currentGroup;
+    
+
+    for (int64_t i = 0; i < inBufferShape.size(); i++){
+        currentGroup.push_back(i);
+
+        if(llvm::find(broadcastDimAttr.asArrayRef(), i) != broadcastDimAttr.asArrayRef().end()){
+            reassoc.push_back(currentGroup);
+            currentGroup.clear();
+        }
+    }
+    if (!currentGroup.empty()) {
+        reassoc.push_back(currentGroup);
+    }
+    if (reassoc.empty()) {
+      reassoc.push_back({0}); 
   }
-  builder.create<mlir::hivm::VBrcOp>(builder.getUnknownLoc(), TypeRange{},
-                                      src, dst, broadcastDimAttr);
+    auto collapsedMemref = builder.create<memref::CollapseShapeOp>(builder.getUnknownLoc(), srcMemref, reassoc);
+
+    builder.create<mlir::linalg::BroadcastOp>(builder.getUnknownLoc(),
+                                      collapsedMemref, dst, broadcastDimAttr);
+
+  }
+  
 }
 
 void CodeGenTileLangNPUIRMLIR::VcastCodegen(const CallNode *op) {

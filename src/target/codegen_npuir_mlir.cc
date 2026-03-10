@@ -83,9 +83,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "bishengir/Dialect/HACC/IR/HACC.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/BuiltinAttributeInterfaces.h"
+#include "mlir/IR/Types.h"
 #include "mlir/IR/ValueRange.h"
+#include "mlir/Support/LLVM.h"
 
 using namespace mlir;
 
@@ -1105,13 +1109,13 @@ void CodeGenTileLangNPUIRMLIR::VbrcCodegen(const CallNode *op) {
     for (int64_t i = 0; i < inBufferShape.size(); i++){
         currentGroup.push_back(i);
 
-        if(llvm::find(broadcastDimAttr.asArrayRef(), i) != broadcastDimAttr.asArrayRef().end()){
+        if(llvm::find(broadcastDimAttr.asArrayRef(), i) == broadcastDimAttr.asArrayRef().end()){
             reassoc.push_back(currentGroup);
             currentGroup.clear();
         }
     }
     if (!currentGroup.empty()) {
-        reassoc.push_back(currentGroup);
+        reassoc.back().append(currentGroup.begin(), currentGroup.end());
     }
     if (reassoc.empty()) {
       reassoc.push_back({0}); 
@@ -1526,13 +1530,13 @@ Value broadcast(Value input, Value output, DenseI64ArrayAttr dims, OpBuilder &bu
     for (int64_t i = 0; i < shape.size(); i++){
         currentGroup.push_back(i);
 
-        if(llvm::find(dims.asArrayRef(), i) != dims.asArrayRef().end()){
+        if(llvm::find(dims.asArrayRef(), i) == dims.asArrayRef().end()){
             reassoc.push_back(currentGroup);
             currentGroup.clear();
         }
     }
     if (!currentGroup.empty()) {
-        reassoc.push_back(currentGroup);
+        reassoc.back().append(currentGroup.begin(), currentGroup.end());
     }
     if (reassoc.empty()) {
       reassoc.push_back({0}); 
@@ -1646,13 +1650,120 @@ void CodeGenTileLangNPUIRMLIR::CreateHIVMBinaryVectorOp(const CallNode *op) {
     builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
                       mlir::ValueRange{dst}, round_attr, transpose, broadcast);
   } else {
-        //src0 = tvm::codegen::transpose(src0, dst, transpose, builder);
-        src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
-        //src1 = tvm::codegen::transpose(src1, dst, transpose, builder);
-        src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+    src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
+    src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+
         builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
                         mlir::ValueRange{dst});
   }
+}
+
+
+Value castToInteger(Value val, mlir::Type type, OpBuilder& builder, Location loc){
+  if(type.isa<IntegerType>()) return val;
+
+  unsigned width = type.getIntOrFloatBitWidth();
+  auto intType = builder.getIntegerType(width);
+  return builder.create<mlir::arith::BitcastOp>(loc, intType, val);
+}
+
+template <typename T>
+void CodeGenTileLangNPUIRMLIR::CreateLogicalVectorOp(const CallNode *op) {
+  auto processImm = [&](mlir::Value &src, int arg_id,
+                        Array<PrimExpr> &buffer_shape) {
+    if (op->args[arg_id].as<IntImm>() || op->args[arg_id].as<FloatImm>() || 
+        op->args[arg_id].as<tir::VarNode>() || op->args[arg_id].as<tir::BufferLoadNode>()) {
+      // Scalar case
+      const CallNode *region_node = op->args[1 - arg_id].as<CallNode>();
+      const BufferLoadNode *buffer_load_node =
+          region_node->args[0].as<BufferLoadNode>();
+      if (op->args[arg_id]->dtype != buffer_load_node->buffer->dtype) {
+        src = ScalarConvertType(op->args[arg_id],
+                                buffer_load_node->buffer->dtype);
+      } else {
+        src = MakeValue(op->args[arg_id]);
+      }
+    } else {
+      // Vector case
+      const CallNode *region_node = op->args[arg_id].as<CallNode>();
+      auto buffer_node = region_node->args[0].as<BufferLoadNode>();
+      buffer_shape = buffer_node->buffer->shape;
+      bool is_scalar_load = true;
+      for (int i = 0; i < buffer_shape.size(); i++) {
+        const IntImmNode* int_imm = region_node->args[2 + i].as<IntImmNode>();
+        if (!int_imm || int_imm->value != 1) {
+          is_scalar_load = false;
+          break;
+        }
+      }
+      const IntImmNode* int_imm = region_node->args[2].as<IntImmNode>();
+      // If load only one element, do not use memref.subview, use memref.load as a scalar
+      if(is_scalar_load) {
+        src = GenMemrefLoadFromRegion(buffer_node);
+      } else {
+        src = GenSubviewFromRegion(region_node);
+      }
+    }
+  };
+  // src0 src1
+  mlir::Value src0, src1;
+  Array<PrimExpr> buffer_shape0, buffer_shape1;
+  processImm(src0, 0, buffer_shape0);
+  processImm(src1, 1, buffer_shape1);
+  // dst
+  const CallNode *region_node_dst = op->args[2].as<CallNode>();
+  // Result will always be a vector. No need to add scalar check.
+  mlir::Value dst = GenSubviewFromRegion(region_node_dst);
+  // transpose
+  mlir::DenseI64ArrayAttr transpose = builder.getDenseI64ArrayAttr({});
+  // broadcast
+  llvm::SmallVector<int64_t> dims =
+      getBroadcastDim(buffer_shape0, buffer_shape1);
+  mlir::DenseI64ArrayAttr broadcast = builder.getDenseI64ArrayAttr(dims);
+
+
+
+
+  // Create hivm::op
+  auto loc = builder.getUnknownLoc();
+
+
+    src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
+    src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+    auto src0_type = mlir::dyn_cast<MemRefType>(src0.getType());
+    auto src1_type = mlir::dyn_cast<MemRefType>(src1.getType());
+    auto dst_type = mlir::dyn_cast<MemRefType>(dst.getType());
+    int64_t rank = dst_type.getRank();
+
+    SmallVector<AffineMap> maps = {
+      builder.getMultiDimIdentityMap(rank),
+      builder.getMultiDimIdentityMap(rank),
+      builder.getMultiDimIdentityMap(rank)
+    };
+
+    SmallVector<utils::IteratorType> iterators = {
+      utils::IteratorType::parallel,
+      utils::IteratorType::parallel
+    };
+
+    auto genericOp = builder.create<mlir::linalg::GenericOp>(loc, TypeRange{}, ValueRange{src0, src1}, ValueRange{dst}, maps, iterators, [&](OpBuilder &b, Location l, ValueRange args){
+      Value castedA = castToInteger(args[0], src0_type.getElementType(), b, l);
+      Value castedB = castToInteger(args[1], src1_type.getElementType(), b, l);
+      Value opResult = b.create<T>(l, castedA, castedB);
+      builder.create<linalg::YieldOp>(l, opResult);
+    });
+
+    // mlir::Block *body = builder.createBlock(&genericOp.getRegion());
+    // body->addArgument(src0_type.getElementType(), loc);
+    // body->addArgument(src1_type.getElementType(), loc);
+    // body->addArgument(dst_type.getElementType(), loc);
+
+    // OpBuilder::InsertionGuard guard(builder);
+    // builder.setInsertionPointToStart(body);
+
+
+
+    
 }
 
 template <typename T>
@@ -2064,11 +2175,11 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_min"))) {
     CreateHIVMBinaryVectorOp<mlir::linalg::MinOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_or"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VOrOp>(op);
+    CreateLogicalVectorOp<mlir::arith::OrIOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_and"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VAndOp>(op);
+    CreateLogicalVectorOp<mlir::arith::AndIOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_xor"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VXorOp>(op);
+    CreateLogicalVectorOp<mlir::arith::XOrIOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_pow"))) {
     CreateHIVMBinaryVectorOp<mlir::hivm::VPowOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_shl"))) {

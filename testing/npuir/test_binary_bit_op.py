@@ -11,7 +11,7 @@ os.environ["TILELANG_ASCEND_MODE"] = "MLIR"
 torch.npu.set_device(0)
 tilelang.cache.clear_cache()
 
-dtype = "float16"
+dtype = "float32"
 # ------------------------------------------------------------
 # Generic binary kernel
 # ------------------------------------------------------------
@@ -20,14 +20,14 @@ def binary_kernel(M, N, block_M, op_name):
 
     @T.prim_func
     def main(
-        A: T.Tensor((N,1), "int32"),
-        B: T.Tensor((N,M), "int32"),
+        A: T.Tensor((N,1), dtype),
+        B: T.Tensor((N,M), dtype),
         Out: T.Tensor((N,M), "int32"),
     ):
         with T.Kernel(grid_M, is_npu=True) as (bx, _):
             # UB buffers
-            acc_A  = T.alloc_shared((N,1), "int32")
-            acc_B  = T.alloc_shared((N,M), "int32")
+            acc_A  = T.alloc_shared((N,1), dtype)
+            acc_B  = T.alloc_shared((N,M), dtype)
             out_ub = T.alloc_shared((N,M), "int32")
 
             # GM -> UB

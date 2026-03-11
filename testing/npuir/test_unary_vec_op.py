@@ -14,32 +14,33 @@ def binary_kernel(M, N, block_M, op, dtype="float16"):
     grid_M = (M + block_M - 1) // block_M
     @T.prim_func
     def main(
-        A: T.Tensor((N,M), dtype),
-        B: T.Tensor((N,1), dtype),
+        Input: T.Tensor((N,1), dtype),
         Out: T.Tensor((N,M), dtype),
     ):
         with T.Kernel(grid_M, is_npu=True) as (bx, _):
             # UB buffers
-            acc_A = T.alloc_shared((N,M), dtype)
-            acc_B = T.alloc_shared((N,1), dtype)
+            acc_input = T.alloc_shared((N,1), dtype)
             out_ub = T.alloc_shared((N,M), dtype)
 
             # GM -> UB
-            T.copy(A, acc_A)
-            T.copy(B, acc_B)
+            T.copy(Input, acc_input)
 
             # Each row: elementwise binary op
             for i in T.serial(block_M):
-                if op == "add":
-                    T.npuir_add(acc_A, acc_B, out_ub)
-                elif op == "sub":
-                    T.npuir_sub(acc_A, acc_B, out_ub)
-                elif op == "mul":
-                    T.npuir_mul(acc_A, acc_B, out_ub)
-                elif op == "div":
-                    T.npuir_div(acc_A, acc_B, out_ub)
+                if op == "exp":
+                    T.npuir_exp(acc_input, out_ub)
+                elif op == "ln":
+                    T.npuir_ln(acc_input, out_ub)
+                elif op == "sqrt":
+                    T.npuir_sqrt(acc_input, out_ub)
+                elif op == "rsqrt":
+                    T.npuir_rsqrt(acc_input, out_ub)
+                elif op == "rec":
+                    T.npuir_rec(acc_input, out_ub)
+                elif op == "abs":
+                    T.npuir_abs(acc_input, out_ub)
                 else:
-                    T.assert_(False, "Unsupported op")
+                    raise ValueError(f"Unsupported op: {op_name}")
 
             # UB -> GM
             T.copy(out_ub, Out)
@@ -113,7 +114,7 @@ def main():
 
     all_pass = True
 
-    for op in ["add", "sub", "mul", "div"]:
+    for op in ["exp", "ln", "sqrt", "abs", "rec", "rsqrt"]:
         print("\n################################")
         print(f"Testing op: {op}")
         print("################################")

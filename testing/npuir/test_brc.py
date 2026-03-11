@@ -6,7 +6,7 @@ import torch
 
 import tilelang
 import tilelang.language as T
-# os.environ["TILELANG_ASCEND_MODE"] = "MLIR"
+os.environ["TILELANG_ASCEND_MODE"] = "MLIR"
 torch.npu.set_device(0)
 tilelang.cache.clear_cache()
 

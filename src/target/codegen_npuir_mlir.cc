@@ -142,10 +142,6 @@ static std::map<std::string, mlir::hivm::PIPE> PIPE_MAP{
     {"PIPE_UNASSIGNED", mlir::hivm::PIPE::PIPE_UNASSIGNED},
 };
 
-static std::map<std::string, mlir::hivm::CompareMode> COMPARE_MODE{
-    {"eq", mlir::hivm::CompareMode::EQ}, {"ne", mlir::hivm::CompareMode::NE},
-    {"lt", mlir::hivm::CompareMode::LT}, {"gt", mlir::hivm::CompareMode::GT},
-    {"ge", mlir::hivm::CompareMode::GE}, {"le", mlir::hivm::CompareMode::LE}};
 
 static std::map<NPU_CORETYPE, mlir::hivm::TCoreType> TCORE_MAP{
     {NPU_CORETYPE::AIC, mlir::hivm::TCoreType::CUBE},
@@ -976,6 +972,49 @@ inline void CodeGenTileLangNPUIRMLIR::UpdatePrimExprMap(const PrimExprNode * key
   this->prim_expr_map[{GetRef<PrimExpr>(key), curr_block}] = val;
 }
 
+
+/// Collapse or expand a memref so its rank matches \p targetRank.
+/// Used to align operands for linalg::MapOp which requires identical ranks.
+static Value reshape(Value val, int64_t targetRank, OpBuilder &builder) {
+  auto memrefType = mlir::dyn_cast<MemRefType>(val.getType());
+  if (!memrefType)
+    return val;
+  int64_t srcRank = memrefType.getRank();
+  if (srcRank == targetRank)
+    return val;
+  auto loc = builder.getUnknownLoc();
+  ArrayRef<int64_t> srcShape = memrefType.getShape();
+  if (srcRank > targetRank) {
+    // Collapse leading dimensions together to reduce rank.
+    // e.g. memref<1x32xi32> -> memref<32xi32> when targetRank==1
+    int64_t diff = srcRank - targetRank;
+    SmallVector<ReassociationIndices> reassoc;
+    ReassociationIndices firstGroup;
+    for (int64_t i = 0; i <= diff; i++)
+      firstGroup.push_back(i);
+    reassoc.push_back(firstGroup);
+    for (int64_t i = diff + 1; i < srcRank; i++)
+      reassoc.push_back({i});
+    return builder.create<memref::CollapseShapeOp>(loc, val, reassoc);
+  }
+  // srcRank < targetRank: expand by adding leading 1-dimensions.
+  // e.g. memref<32xi32> -> memref<1x32xi32> when targetRank==2
+  int64_t diff = targetRank - srcRank;
+  SmallVector<int64_t> newShape(diff, 1);
+  newShape.append(srcShape.begin(), srcShape.end());
+  SmallVector<ReassociationIndices> reassoc;
+  ReassociationIndices firstGroup;
+  for (int64_t i = 0; i <= diff; i++)
+    firstGroup.push_back(i);
+  reassoc.push_back(firstGroup);
+  for (int64_t i = diff + 1; i < targetRank; i++)
+    reassoc.push_back({i});
+  auto resultType = MemRefType::get(newShape, memrefType.getElementType(),
+                                    MemRefLayoutAttrInterface{},
+                                    memrefType.getMemorySpace());
+  return builder.create<memref::ExpandShapeOp>(loc, resultType, val, reassoc);
+}
+
 Value broadcast(Value input, Value output, DenseI64ArrayAttr dims, OpBuilder &builder){
   auto inputType = input.getType();
   auto loc = builder.getUnknownLoc();
@@ -1120,28 +1159,39 @@ void CodeGenTileLangNPUIRMLIR::BarrierCodegen(const CallNode *op) {
 }
 
 void CodeGenTileLangNPUIRMLIR::VselectCodegen(const CallNode *op) {
-  /// Generate hivm.hir.vsel for tl.npuir_select.
+  /// Generate linalg.map { arith.select } for tl.npuir_select.
   /// before:
   ///   T.npuir_select(Cond_VEC, A_VEC, B_VEC, C_VEC)
-  /// after:
-  ///   hivm.hir.vsel ins(%v__9, %A_VEC, %B_VEC : memref<32x64xi1, strided<[64,
-  ///   1], offset:0>, #hivm.address_space<ub>>, memref<32x64xf16, strided<[64,
-  ///   1], offset:0>, #hivm.address_space<ub>>, memref<32x64xf16, strided<[64,
-  ///   1], offset:0>, #hivm.address_space<ub>>) outs(%C_VEC : memref<32x64xf16,
-  ///   strided<[64, 1], offset:0>, #hivm.address_space<ub>>)
   tvm::tl::NpuirSelect npuirop(op->args, this->vmap);
   // gen memref.subview
-  auto cond_data_name = GenSubviewFromRegion(npuirop.cond, npuirop.cond_range);
-  auto src0_data_name = GenSubviewFromRegion(npuirop.src0, npuirop.src0_range);
-  auto src1_data_name = GenSubviewFromRegion(npuirop.src1, npuirop.src1_range);
-  auto dst_data_name = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  // gen mlir::hivm::VSelOp
-  auto broadcastDim = getBroadcastDim(npuirop.src0->shape, npuirop.dst->shape);
-  auto selOp = builder.create<mlir::hivm::VSelOp>(
-      builder.getUnknownLoc(), mlir::TypeRange{},
-      mlir::ValueRange{cond_data_name, src0_data_name, src1_data_name},
-      mlir::ValueRange{dst_data_name}, mlir::Value());
-  selOp->setAttr("broadcast", builder.getDenseI64ArrayAttr(broadcastDim));
+  auto cond = GenSubviewFromRegion(npuirop.cond, npuirop.cond_range);
+  auto src0 = GenSubviewFromRegion(npuirop.src0, npuirop.src0_range);
+  auto src1 = GenSubviewFromRegion(npuirop.src1, npuirop.src1_range);
+  auto dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  // broadcast
+  auto broadcastDim0 = getBroadcastDim(npuirop.src0->shape, npuirop.dst->shape);
+  auto broadcast0 = builder.getDenseI64ArrayAttr(broadcastDim0);
+  auto broadcastDim1 = getBroadcastDim(npuirop.src1->shape, npuirop.dst->shape);
+  auto broadcast1 = builder.getDenseI64ArrayAttr(broadcastDim1);
+  auto broadcastDimCond = getBroadcastDim(npuirop.cond->shape, npuirop.dst->shape);
+  auto broadcastCond = builder.getDenseI64ArrayAttr(broadcastDimCond);
+  cond = tvm::codegen::broadcast(cond, dst, broadcastCond, builder);
+  src0 = tvm::codegen::broadcast(src0, dst, broadcast0, builder);
+  src1 = tvm::codegen::broadcast(src1, dst, broadcast1, builder);
+  // Align ranks
+  auto dstType = mlir::dyn_cast<MemRefType>(dst.getType());
+  auto src0Type = mlir::dyn_cast<MemRefType>(src0.getType());
+  if (dstType && src0Type && dstType.getRank() != src0Type.getRank()) {
+    int64_t targetRank = src0Type.getRank();
+    dst = reshape(dst, targetRank, builder);
+    cond = reshape(cond, targetRank, builder);
+  }
+  auto loc = builder.getUnknownLoc();
+  builder.create<mlir::linalg::MapOp>(loc, ValueRange{cond, src0, src1}, dst,
+      [&](OpBuilder &b, Location l, ValueRange args) {
+    Value result = b.create<mlir::arith::SelectOp>(l, args[0], args[1], args[2]);
+    b.create<linalg::YieldOp>(l, result);
+  });
 }
 
 void CodeGenTileLangNPUIRMLIR::VbrcCodegen(const CallNode *op) {
@@ -1270,13 +1320,13 @@ void CodeGenTileLangNPUIRMLIR::VAtomicAddCodegen(const CallNode *op) {
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
 
   // create StoreOp
-  auto newStoreOp = builder.create<hivm::StoreOp>(
+  auto newStoreOp = builder.create<hfusion::StoreOp>(
       builder.getUnknownLoc(),
       TypeRange{},
       src,
       dst
   );
-  hivm::AtomicKind hvAtomicKind = hivm::AtomicKind::ADD;
+  hfusion::AtomicKind hvAtomicKind = hfusion::AtomicKind::ADD;
   newStoreOp.setAtomicKind(hvAtomicKind);
 }
 
@@ -1568,21 +1618,13 @@ void CodeGenTileLangNPUIRMLIR::BitcastCodegen(const CallNode *op) {
                                           src_layout, src_memspace);
 
 
-    auto md = builder.create<mlir::memref::ExtractStridedMetadataOp>(builder.getUnknownLoc(), src);
-    llvm::SmallVector<mlir::OpFoldResult> sizes;
-    llvm::SmallVector<mlir::OpFoldResult> strides;
-    for (mlir::Value s : md.getSizes()) sizes.push_back(s);
-    for (mlir::Value s : md.getStrides()) strides.push_back(s);
-
-    mlir::Value dst = builder.create<mlir::memref::ReinterpretCastOp>(
-        builder.getUnknownLoc(), res_type, md.getBaseBuffer(), md.getOffset(), sizes, strides);
-      
+    Value initMemref = builder.create<memref::AllocOp>(builder.getUnknownLoc(), res_type, ValueRange{});
     builder.create<mlir::linalg::MapOp>(builder.getUnknownLoc(), ValueRange{src},
-                                          dst, [&](OpBuilder &b, Location l, ValueRange args){
+                                          initMemref, [&](OpBuilder &b, Location l, ValueRange args){
       Value opResult = b.create<mlir::arith::BitcastOp>(l, res_type.getElementType(), args[0]);
       b.create<linalg::YieldOp>(l, opResult);
     });
-
+    SmartMemRefCopy(initMemref, src);
   } else if (auto tensor_type = mlir::dyn_cast<RankedTensorType>(src_type)) {
     auto src_shape = tensor_type.getShape();
     auto res_type =
@@ -1635,47 +1677,7 @@ Value bitcast(Value val, mlir::Type type, OpBuilder& builder, Location loc){
 }
 
 
-/// Collapse or expand a memref so its rank matches \p targetRank.
-/// Used to align operands for linalg::MapOp which requires identical ranks.
-static Value reshape(Value val, int64_t targetRank, OpBuilder &builder) {
-  auto memrefType = mlir::dyn_cast<MemRefType>(val.getType());
-  if (!memrefType)
-    return val;
-  int64_t srcRank = memrefType.getRank();
-  if (srcRank == targetRank)
-    return val;
-  auto loc = builder.getUnknownLoc();
-  ArrayRef<int64_t> srcShape = memrefType.getShape();
-  if (srcRank > targetRank) {
-    // Collapse leading dimensions together to reduce rank.
-    // e.g. memref<1x32xi32> -> memref<32xi32> when targetRank==1
-    int64_t diff = srcRank - targetRank;
-    SmallVector<ReassociationIndices> reassoc;
-    ReassociationIndices firstGroup;
-    for (int64_t i = 0; i <= diff; i++)
-      firstGroup.push_back(i);
-    reassoc.push_back(firstGroup);
-    for (int64_t i = diff + 1; i < srcRank; i++)
-      reassoc.push_back({i});
-    return builder.create<memref::CollapseShapeOp>(loc, val, reassoc);
-  }
-  // srcRank < targetRank: expand by adding leading 1-dimensions.
-  // e.g. memref<32xi32> -> memref<1x32xi32> when targetRank==2
-  int64_t diff = targetRank - srcRank;
-  SmallVector<int64_t> newShape(diff, 1);
-  newShape.append(srcShape.begin(), srcShape.end());
-  SmallVector<ReassociationIndices> reassoc;
-  ReassociationIndices firstGroup;
-  for (int64_t i = 0; i <= diff; i++)
-    firstGroup.push_back(i);
-  reassoc.push_back(firstGroup);
-  for (int64_t i = diff + 1; i < targetRank; i++)
-    reassoc.push_back({i});
-  auto resultType = MemRefType::get(newShape, memrefType.getElementType(),
-                                    MemRefLayoutAttrInterface{},
-                                    memrefType.getMemorySpace());
-  return builder.create<memref::ExpandShapeOp>(loc, resultType, val, reassoc);
-}
+
 
 template <typename T>
 void CodeGenTileLangNPUIRMLIR::CreateHIVMBinaryVectorOp(const CallNode *op) {
@@ -1737,13 +1739,54 @@ void CodeGenTileLangNPUIRMLIR::CreateHIVMBinaryVectorOp(const CallNode *op) {
   // Create hivm::op
   auto loc = builder.getUnknownLoc();
 
-  if constexpr (std::is_same_v<T, mlir::hivm::VCmpOp>) {
-    mlir::hivm::CompareMode mode =
-        COMPARE_MODE[op->args[3].as<StringImm>().value()->value];
-    auto cmp_attr =
-        mlir::hivm::CompareModeAttr::get(builder.getContext(), mode);
-    builder.create<T>(loc, mlir::TypeRange{}, mlir::ValueRange{src0, src1},
-                      mlir::ValueRange{dst}, cmp_attr, transpose, broadcast);
+  if constexpr (std::is_same_v<T, mlir::arith::CmpFOp>) {
+    src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
+    src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+    auto dstType = mlir::dyn_cast<MemRefType>(dst.getType());
+    auto src0Type = mlir::dyn_cast<MemRefType>(src0.getType());
+    if (dstType && src0Type && dstType.getRank() != src0Type.getRank()) {
+      int64_t targetRank = src0Type.getRank();
+      dst = reshape(dst, targetRank, builder);
+    }
+    std::string cmp_mod = op->args[3].as<StringImm>().value()->value;
+    static std::map<std::string, mlir::arith::CmpFPredicate> fCmpMap = {
+        {"eq", mlir::arith::CmpFPredicate::OEQ},
+        {"ne", mlir::arith::CmpFPredicate::ONE},
+        {"lt", mlir::arith::CmpFPredicate::OLT},
+        {"gt", mlir::arith::CmpFPredicate::OGT},
+        {"ge", mlir::arith::CmpFPredicate::OGE},
+        {"le", mlir::arith::CmpFPredicate::OLE},
+    };
+    builder.create<mlir::linalg::MapOp>(loc, ValueRange{src0, src1}, dst,
+        [&](OpBuilder &b, Location l, ValueRange args) {
+      Value cmpResult = b.create<mlir::arith::CmpFOp>(l, fCmpMap[cmp_mod],
+                                                        args[0], args[1]);
+      b.create<linalg::YieldOp>(l, cmpResult);
+    });
+  } else if constexpr (std::is_same_v<T, mlir::arith::CmpIOp>) {
+    src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
+    src1 = tvm::codegen::broadcast(src1, dst, broadcast, builder);
+    auto dstType = mlir::dyn_cast<MemRefType>(dst.getType());
+    auto src0Type = mlir::dyn_cast<MemRefType>(src0.getType());
+    if (dstType && src0Type && dstType.getRank() != src0Type.getRank()) {
+      int64_t targetRank = src0Type.getRank();
+      dst = reshape(dst, targetRank, builder);
+    }
+    std::string cmp_mod = op->args[3].as<StringImm>().value()->value;
+    static std::map<std::string, mlir::arith::CmpIPredicate> iCmpMap = {
+        {"eq", mlir::arith::CmpIPredicate::eq},
+        {"ne", mlir::arith::CmpIPredicate::ne},
+        {"lt", mlir::arith::CmpIPredicate::slt},
+        {"gt", mlir::arith::CmpIPredicate::sgt},
+        {"ge", mlir::arith::CmpIPredicate::sge},
+        {"le", mlir::arith::CmpIPredicate::sle},
+    };
+    builder.create<mlir::linalg::MapOp>(loc, ValueRange{src0, src1}, dst,
+        [&](OpBuilder &b, Location l, ValueRange args) {
+      Value cmpResult = b.create<mlir::arith::CmpIOp>(l, iCmpMap[cmp_mod],
+                                                        args[0], args[1]);
+      b.create<linalg::YieldOp>(l, cmpResult);
+    });
   } else if constexpr (std::is_same_v<T, mlir::math::PowFOp> ||
                        std::is_same_v<T, mlir::math::IPowIOp>) {
     src0 = tvm::codegen::broadcast(src0, dst, broadcast, builder);
@@ -2060,7 +2103,15 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_select"))) {
     VselectCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_cmp"))) {
-    CreateHIVMBinaryVectorOp<mlir::hivm::VCmpOp>(op);
+    // Determine source dtype from whichever arg is a buffer region.
+    const CallNode *region = op->args[0].as<CallNode>();
+    if (!region) region = op->args[1].as<CallNode>();
+    DataType src_dtype = region->args[0].as<BufferLoadNode>()->buffer->dtype;
+    if (src_dtype.is_float() || src_dtype.is_bfloat16()) {
+      CreateHIVMBinaryVectorOp<mlir::arith::CmpFOp>(op);
+    } else {
+      CreateHIVMBinaryVectorOp<mlir::arith::CmpIOp>(op);
+    }
   } else if (op->op.same_as(Op::Get("tl.npuir_load_nd2nz"))) {
     Nd2NzCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_store_nz2nd"))) {

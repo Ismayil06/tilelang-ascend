@@ -13,30 +13,22 @@ BLOCK_N = 32
 
 
 def bitcast_kernel(M, N, block_M, block_N, src_dtype="float16", dst_dtype="int16"):
-    """Bitcast a (M, N) tensor from src_dtype to dst_dtype (same bit-width)."""
     m_num = M // block_M
     n_num = N // block_N
-    BLOCK_SIZE = 8
 
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), src_dtype)
-
+            A: T.Tensor((M, N), src_dtype),
     ):
-        with T.Kernel(BLOCK_SIZE, is_npu=True) as (cid, _):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx_ = cid // n_num
+            bx = bx_ * block_M
+            by_ = cid % n_num
+            by = by_ * block_N
+
             A_VEC = T.alloc_ub((block_M, block_N), src_dtype)
-
-            for i in T.serial(T.ceildiv(m_num * n_num, BLOCK_SIZE)):
-                block_id = i * BLOCK_SIZE + cid
-                if block_id < m_num * n_num:
-                    block_id_m = block_id // n_num
-                    block_id_n = block_id % n_num
-                    bx = block_id_m * block_M
-                    by = block_id_n * block_N
-
-                    T.copy(A[bx, by], A_VEC)
-                    T.npuir_bitcast(A_VEC, dst_dtype)
-                    T.copy(A_VEC, A[bx, by])
+            T.copy(A[bx, by], A_VEC)
+            T.npuir_bitcast(A_VEC, dst_dtype)
 
     return main
 

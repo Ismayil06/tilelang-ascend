@@ -229,7 +229,7 @@ private:
   void VcastCodegen(const CallNode *op);
   void VreduceCodegen(const CallNode *op);
   void VcumsumCodegen(const CallNode *op);
-  void VAtomicAddCodegen(const CallNode *op);
+  void VAtomicCodegen(const CallNode *op, hfusion::AtomicKind atomicKind);
   void VgatherCodegen(const CallNode *op);
   void VtransposeCodegen(const CallNode *op);
   void VinterleaveCodegen(const CallNode *op);
@@ -249,6 +249,7 @@ private:
   template <typename T> void CreateHIVMBinaryVectorOp(const CallNode *op);
   template <typename T> void CreateLogicalVectorOp(const CallNode *op);
   template <typename T, typename U> void UnaryVecOpCodegen(const CallNode *op);
+  void ReluOpCodegen(const CallNode *op);
   void BarrierCodegen(const CallNode *op);
   void VselectCodegen(const CallNode *op);
   template <typename T, typename U>

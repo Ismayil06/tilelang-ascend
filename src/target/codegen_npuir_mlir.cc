@@ -880,6 +880,48 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CastNode *op) {
 }
 
 mlir::Value
+CodeGenTileLangNPUIRMLIR::GenExtractSliceFromRegion(const CallNode *region_node) {
+  tvm::tl::RegionOp regionop(region_node->args, this->vmap);
+  return GenExtractSliceFromRegion(regionop.GetBuffer(), regionop.GetRanges());
+}
+
+mlir::Value CodeGenTileLangNPUIRMLIR::GenExtractSliceFromRegion(Buffer buffer_data,
+                                                               Array<Range> range) {
+  Array<PrimExpr> region_shape;
+  Array<PrimExpr> region_indices;
+  for (Range r: range) {
+    region_shape.push_back(r.get()->extent);
+    region_indices.push_back(r.get()->min);
+  }
+  mlir::Value v_value = GetVarValue(buffer_data);
+  if (IsEqual(buffer_data->shape, region_shape) && AllZero(region_indices)) {
+    return v_value;
+  }
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides;
+  for (Range r: range) {
+    if (auto s_int = as_const_int(r.get()->min)) {
+      offsets.push_back(builder.getI64IntegerAttr(*s_int));
+    } else {
+      mlir::Value indexVal = CreateIndexCastOp(MakeValue(r.get()->min));
+      offsets.push_back(indexVal);
+    }
+    if (auto s_int = as_const_int(r.get()->extent)) {
+      sizes.push_back(builder.getI64IntegerAttr(*s_int));
+    } else {
+      mlir::Value shapeVal = CreateIndexCastOp(MakeValue(r.get()->extent));
+      sizes.push_back(shapeVal);
+    }
+    strides.push_back(builder.getI64IntegerAttr(1));
+  }
+  auto extractSliceOp =
+      builder.create<mlir::tensor::ExtractSliceOp>(builder.getUnknownLoc(),
+          v_value, offsets, sizes, strides);
+  return extractSliceOp.getResult();
+}
+
+mlir::Value
 CodeGenTileLangNPUIRMLIR::GenSubviewFromRegion(const CallNode *region_node) {
   tvm::tl::RegionOp regionop(region_node->args, this->vmap);
   return GenSubviewFromRegion(regionop.GetBuffer(), regionop.GetRanges());
@@ -1328,13 +1370,13 @@ void CodeGenTileLangNPUIRMLIR::VcumsumCodegen(const CallNode *op) {
   ///   hfusion.cumsum ins(src) cum_dims = [0] reverse = false -> result
   tvm::tl::NpuirCumsum npuirop(op->args, this->vmap);
   mlir::Location loc = builder.getUnknownLoc();
-  Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  Value src = GenExtractSliceFromRegion(npuirop.src, npuirop.src_range);
+  Value dst = GetVarValue(npuirop.dst);
   auto reverse_mode = npuirop.reverse;
-  builder.create<mlir::hfusion::CumsumOp>(
-      loc, mlir::dyn_cast<MemRefType>(dst.getType()), src,
+  auto resultOp = builder.create<mlir::hfusion::CumsumOp>(
+      loc, dst.getType(), src,
       builder.getDenseI64ArrayAttr(npuirop.cum_dims), reverse_mode);
-  //SmartMemRefCopy(resultOp.getOutput(), dst);
+  
 }
 
 void CodeGenTileLangNPUIRMLIR::VAtomicCodegen(const CallNode *op,
@@ -2690,6 +2732,16 @@ mlir::Value CodeGenTileLangNPUIRMLIR::GetVarValue(const VarNode *v) const {
   auto it = var_map_.find(v);
   ICHECK(it != var_map_.end()) << "cannot find variable " << v->name_hint;
   return it->second;
+}
+
+mlir::Value CodeGenTileLangNPUIRMLIR::GetVarValue(const CallNode *region_node) const {
+  tvm::tl::RegionOp regionop(region_node->args, this->vmap);
+  return GetVarValue(regionop.GetBuffer());
+}
+
+mlir::Value CodeGenTileLangNPUIRMLIR::GetVarValue(const Buffer &buffer_data) const {
+  auto var_ptr = buffer_data->data.get();
+  return GetVarValue(var_ptr);
 }
 
 mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const VarNode *op) {

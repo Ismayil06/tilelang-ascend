@@ -1363,19 +1363,23 @@ void CodeGenTileLangNPUIRMLIR::VreduceCodegen(const CallNode *op) {
 }
 
 void CodeGenTileLangNPUIRMLIR::VcumsumCodegen(const CallNode *op) {
-  /// Generate hfusion.cumsum for tl.npuir_cumsum.
+  /// Generate hivm.hir.cumsum for tl.npuir_cumsum.
   /// before:
   ///   T.npuir_cumsum(src, dst, dim, reverse)
   /// after:
-  ///   hfusion.cumsum ins(src) cum_dims = [0] reverse = false -> result
+  ///   hivm.hir.vcumsum ins(src) outs(dst) cum_dims = [0] for reverse = false
   tvm::tl::NpuirCumsum npuirop(op->args, this->vmap);
   mlir::Location loc = builder.getUnknownLoc();
-  Value src = GenExtractSliceFromRegion(npuirop.src, npuirop.src_range);
-  Value dst = GetVarValue(npuirop.dst);
+  Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
+  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
   auto reverse_mode = npuirop.reverse;
-  auto resultOp = builder.create<mlir::hfusion::CumsumOp>(
-      loc, dst.getType(), src,
-      builder.getDenseI64ArrayAttr(npuirop.cum_dims), reverse_mode);
+  if(reverse_mode == true){
+    ICHECK(false) <<"reverse=True is not yet supported\n";
+    return;
+  }
+  builder.create<mlir::hivm::VCumsumOp>(
+      loc, TypeRange{}, src, dst,
+      builder.getDenseI64ArrayAttr(npuirop.cum_dims));
   
 }
 
@@ -1406,12 +1410,8 @@ void CodeGenTileLangNPUIRMLIR::VgatherCodegen(const CallNode *op) {
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
   Value indices = GenSubviewFromRegion(npuirop.indices, npuirop.indices_range);
 
-  // Compute gather axis as the last dimension (rank - 1)
-  auto dstMemRefType = mlir::dyn_cast<MemRefType>(dst.getType());
-  int64_t gatherAxis = dstMemRefType.getRank() - 1;
-  builder.create<mlir::hfusion::GatherOp>(
-      builder.getUnknownLoc(), src, indices, dst, gatherAxis);
-  //SmartMemRefCopy(resultOp.getResult()[0], dst);
+  builder.create<mlir::hivm::VGatherOp>(builder.getUnknownLoc(), TypeRange{},
+                                        src, indices, dst);
 }
 
 void CodeGenTileLangNPUIRMLIR::VtransposeCodegen(const CallNode *op) {
@@ -1474,7 +1474,7 @@ void CodeGenTileLangNPUIRMLIR::VdeinterleaveCodegen(const CallNode *op) {
 }
 
 void CodeGenTileLangNPUIRMLIR::VarangeCodegen(const CallNode *op) {
-  tvm::tl::NpuirArange npuirop(op->args, this->vmap);
+ tvm::tl::NpuirArange npuirop(op->args, this->vmap);
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
 
   auto offsetValue = builder.create<mlir::arith::ConstantOp>(
@@ -1490,9 +1490,8 @@ void CodeGenTileLangNPUIRMLIR::VarangeCodegen(const CallNode *op) {
     strides.push_back(stride);
   }
 
-  builder.create<mlir::hfusion::ArangeOp>(
-      builder.getUnknownLoc(), offset, mlir::ValueRange(strides), dst);
-  //SmartMemRefCopy(resultOp.getResultTensor(), dst);
+  builder.create<mlir::hivm::VArangeOp>(builder.getUnknownLoc(), TypeRange{},
+                                        dst, offset, strides);
 }
 
 void CodeGenTileLangNPUIRMLIR::VconcatCodegen(const CallNode *op) {
@@ -1541,10 +1540,8 @@ void CodeGenTileLangNPUIRMLIR::VflipCodegen(const CallNode *op) {
   tvm::tl::NpuirFlip npuirop(op->args, this->vmap);
   Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  auto resultOp = builder.create<mlir::hfusion::FlipOp>(
-      builder.getUnknownLoc(), mlir::dyn_cast<MemRefType>(dst.getType()), src,
-      npuirop.axis);
-  SmartMemRefCopy(resultOp.getOutput(), dst);
+  builder.create<mlir::hivm::VFlipOp>(builder.getUnknownLoc(), TypeRange{}, src,
+                                      dst, npuirop.axis);
 }
 
 void CodeGenTileLangNPUIRMLIR::Nd2NzCodegen(const CallNode *op) {
@@ -1701,7 +1698,7 @@ void CodeGenTileLangNPUIRMLIR::BitcastCodegen(const CallNode *op) {
       Value opResult = b.create<mlir::arith::BitcastOp>(l, res_type.getElementType(), args[0]);
       b.create<linalg::YieldOp>(l, opResult);
     });
-    SmartMemRefCopy(initMemref, src);
+    //SmartMemRefCopy(initMemref, src);
   } else if (auto tensor_type = mlir::dyn_cast<RankedTensorType>(src_type)) {
     auto src_shape = tensor_type.getShape();
     auto res_type =
@@ -2252,21 +2249,23 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CallNode *op) {
     VcumsumCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_atomic_add"))) {
     VAtomicCodegen(op, hfusion::AtomicKind::ADD);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_and"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::XOR);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_cas"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::CAS);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_max"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::MAX);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_min"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::MIN);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_or"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::OR);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xchg"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::XCHG);
-  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xor"))) {
-    VAtomicCodegen(op, hfusion::AtomicKind::XOR);
-  } else if (op->op.same_as(Op::Get("tl.npuir_gather"))) {
+  } 
+  // else if (op->op.same_as(Op::Get("tl.npuir_atomic_and"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::AND);
+  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_cas"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::CAS);
+  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_max"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::MAX);
+  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_min"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::MIN);
+  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_or"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::OR);
+  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xchg"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::XCHG);
+  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xor"))) {
+  //   VAtomicCodegen(op, hfusion::AtomicKind::XOR);
+  // } 
+  else if (op->op.same_as(Op::Get("tl.npuir_gather"))) {
     VgatherCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_transpose"))) {
     VtransposeCodegen(op);

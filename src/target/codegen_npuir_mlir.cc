@@ -50,6 +50,7 @@
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
@@ -1344,22 +1345,71 @@ void CodeGenTileLangNPUIRMLIR::VcastCodegen(const CallNode *op) {
 }
 
 void CodeGenTileLangNPUIRMLIR::VreduceCodegen(const CallNode *op) {
-  /// Generate hivm.hir.vreduce for T.npuir_reduce.
+  /// Generate linalg.reduce for T.npuir_reduce.
   /// before:
   ///   T.npuir_reduce(src, dst, dims, type)
   /// after:
-  ///   hivm.hir.vreduce <type> ins(src) outs(dst) reduce_dims = [dims]
+  ///   linalg.reduce ins(src) outs(dst) dimensions = [dims] { combiner_op }
   tvm::tl::NpuirReduce npuirop(op->args, this->vmap);
   mlir::Location loc = builder.getUnknownLoc();
   Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
   auto reduce_mode = npuirop.reduce_mode;
-  mlir::hivm::ReduceOperation operation = NPUIR_STR_REDUCEOP[reduce_mode];
-  mlir::hivm::ReduceOpAttr mode =
-      mlir::hivm::ReduceOpAttr::get(&context, operation);
-  builder.create<mlir::hivm::VReduceOp>(
-      loc, TypeRange{}, src, dst, mode,
-      builder.getDenseI64ArrayAttr(npuirop.reduce_dims));
+
+  auto srcType = mlir::dyn_cast<MemRefType>(src.getType());
+  mlir::Type elemType = srcType.getElementType();
+  bool isFloat = isa<mlir::FloatType>(elemType);
+
+  // linalg.reduce requires output rank = input rank - number of reduce dims.
+  // The dst buffer may have size-1 dimensions for the reduced axes.
+  // Collapse the dst to remove these size-1 dimensions at reduce_dims positions.
+  int64_t srcRank = srcType.getRank();
+  int64_t numReduceDims = npuirop.reduce_dims.size();
+  int64_t targetRank = srcRank - numReduceDims;
+  dst = reshape(dst, targetRank, builder);
+
+  auto reductionBodyBuilder = [&](OpBuilder &b, Location loc,
+                                  ValueRange args) {
+    Value lhs = args[0];
+    Value rhs = args[1];
+    Value result;
+
+    if (reduce_mode == "sum") {
+      if (isFloat)
+        result = b.create<mlir::arith::AddFOp>(loc, lhs, rhs);
+      else
+        result = b.create<mlir::arith::AddIOp>(loc, lhs, rhs);
+    } else if (reduce_mode == "prod") {
+      if (isFloat)
+        result = b.create<mlir::arith::MulFOp>(loc, lhs, rhs);
+      else
+        result = b.create<mlir::arith::MulIOp>(loc, lhs, rhs);
+    } else if (reduce_mode == "max") {
+      if (isFloat)
+        result = b.create<mlir::arith::MaximumFOp>(loc, lhs, rhs);
+      else
+        result = b.create<mlir::arith::MaxSIOp>(loc, lhs, rhs);
+    } else if (reduce_mode == "min") {
+      if (isFloat)
+        result = b.create<mlir::arith::MinimumFOp>(loc, lhs, rhs);
+      else
+        result = b.create<mlir::arith::MinSIOp>(loc, lhs, rhs);
+    } else if (reduce_mode == "any" || reduce_mode == "ori") {
+      result = b.create<mlir::arith::OrIOp>(loc, lhs, rhs);
+    } else if (reduce_mode == "all") {
+      result = b.create<mlir::arith::AndIOp>(loc, lhs, rhs);
+    } else if (reduce_mode == "xori") {
+      result = b.create<mlir::arith::XOrIOp>(loc, lhs, rhs);
+    } else {
+      ICHECK(false) << "Unsupported reduce mode for linalg.reduce: "
+                    << reduce_mode;
+      return;
+    }
+    b.create<linalg::YieldOp>(loc, result);
+  };
+
+  builder.create<linalg::ReduceOp>(loc, ValueRange{src}, ValueRange{dst},
+                                   npuirop.reduce_dims, reductionBodyBuilder);
 }
 
 void CodeGenTileLangNPUIRMLIR::VcumsumCodegen(const CallNode *op) {
@@ -1490,23 +1540,56 @@ void CodeGenTileLangNPUIRMLIR::VarangeCodegen(const CallNode *op) {
     strides.push_back(stride);
   }
 
-  builder.create<mlir::hivm::VArangeOp>(builder.getUnknownLoc(), TypeRange{},
-                                        dst, offset, strides);
+  auto arangeOp =   builder.create<mlir::hfusion::ArangeOp>(
+      builder.getUnknownLoc(), offset, mlir::ValueRange(strides), dst);
+  auto elemType = mlir::cast<mlir::ShapedType>(dst.getType()).getElementType();
+  if (mlir::isa<mlir::FloatType>(elemType)) {
+    auto &region = arangeOp.getRegion();
+    region.walk([&](mlir::arith::IndexCastOp indexCastOp) {
+      if (indexCastOp.getType() == elemType) {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(indexCastOp);
+        auto intVal = builder.create<mlir::arith::IndexCastOp>(
+            builder.getUnknownLoc(), builder.getI64Type(), indexCastOp.getIn());
+        auto floatVal = builder.create<mlir::arith::SIToFPOp>(
+            builder.getUnknownLoc(), elemType, intVal);
+        indexCastOp.replaceAllUsesWith(floatVal.getResult());
+        indexCastOp.erase();
+      }
+    });
+  }
 }
 
 void CodeGenTileLangNPUIRMLIR::VconcatCodegen(const CallNode *op) {
   tvm::tl::NpuirConcat npuirop(op->args, this->vmap);
   auto dim = builder.getIntegerAttr(builder.getI64Type(), npuirop.dim);
-  llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i = 0; i < n_srcs; i++) {
-    Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
-    srcs.push_back(src);
+
+  // Check the type of source buffer to determine tensor vs memref path
+  mlir::Value first_src_val = GetVarValue(npuirop.srcs[0]);
+  auto src_type = first_src_val.getType();
+
+  if (mlir::dyn_cast<RankedTensorType>(src_type)) {
+    // Tensor path: use tensor::ConcatOp
+    llvm::SmallVector<Value> srcs;
+    for (size_t i = 0; i < n_srcs; i++) {
+      Value src = GenExtractSliceFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
+      srcs.push_back(src);
+    }
+    mlir::ValueRange srcs_vr(srcs);
+    builder.create<mlir::tensor::ConcatOp>(builder.getUnknownLoc(), npuirop.dim, srcs_vr);
+  } else {
+    // Memref path: use hivm::VConcatOp
+    llvm::SmallVector<Value> srcs;
+    for (size_t i = 0; i < n_srcs; i++) {
+      Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
+      srcs.push_back(src);
+    }
+    mlir::ValueRange srcs_vr(srcs);
+    Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+    builder.create<mlir::hivm::VConcatOp>(builder.getUnknownLoc(), TypeRange{},
+                                          dim, srcs_vr, dst);
   }
-  mlir::ValueRange srcs_vr(srcs);
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  builder.create<mlir::hivm::VConcatOp>(builder.getUnknownLoc(), TypeRange{},
-                                        dim, srcs_vr, dst);
 }
 
 void CodeGenTileLangNPUIRMLIR::VpadCodegen(const CallNode *op) {
@@ -2250,21 +2333,21 @@ mlir::Value CodeGenTileLangNPUIRMLIR::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_atomic_add"))) {
     VAtomicCodegen(op, hfusion::AtomicKind::ADD);
   } 
-  // else if (op->op.same_as(Op::Get("tl.npuir_atomic_and"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::AND);
-  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_cas"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::CAS);
-  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_max"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::MAX);
-  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_min"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::MIN);
-  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_or"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::OR);
-  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xchg"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::XCHG);
-  // } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xor"))) {
-  //   VAtomicCodegen(op, hfusion::AtomicKind::XOR);
-  // } 
+  else if (op->op.same_as(Op::Get("tl.npuir_atomic_and"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::AND);
+  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_cas"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::CAS);
+  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_max"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::MAX);
+  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_min"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::MIN);
+  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_or"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::OR);
+  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xchg"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::XCHG);
+  } else if (op->op.same_as(Op::Get("tl.npuir_atomic_xor"))) {
+    VAtomicCodegen(op, hfusion::AtomicKind::XOR);
+  } 
   else if (op->op.same_as(Op::Get("tl.npuir_gather"))) {
     VgatherCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_transpose"))) {

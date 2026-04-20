@@ -2300,7 +2300,7 @@ void CodeGenTileLangNPUIRDEV::VgatherCodegen(const CallNode *op) {
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
   Value indices = GenSubviewFromRegion(npuirop.indices, npuirop.indices_range);
 
-  builder.create<mlir::hivm::VGatherOp>(builder.getUnknownLoc(), TypeRange{},
+  builder.create<mlir::hivm::VGatherOp>(builder.getUnknownLoc(), TypeRange{dst.getType()},
                                         src, indices, dst);
 }
 

@@ -2764,13 +2764,11 @@ void CodeGenTileLangNPUIRDEV::VconcatCodegen(const CallNode *op) {
 
 void CodeGenTileLangNPUIRDEV::VpadCodegen(const CallNode *op) {
   tvm::tl::NpuirPad npuirop(op->args, this->vmap);
-
-  mlir::Value src = GenExtractSliceFromRegion(npuirop.src, npuirop.src_range);
-  mlir::Value dst_ori = GetVarValue(npuirop.dst);
-  mlir::Value pad_value = MakeValue(npuirop.pad_value);
-
-  llvm::SmallVector<mlir::Value> low;
-  llvm::SmallVector<mlir::Value> high;
+  Value src = GenExtractSliceFromRegion(npuirop.src, npuirop.src_range);
+  Value dst = GetVarValue(npuirop.dst);
+  Value pad_value = MakeValue(npuirop.pad_value);
+  llvm::SmallVector<Value> low;
+  llvm::SmallVector<Value> high;
   for (auto l : npuirop.low) {
     low.push_back(CreateIndexCastOp(MakeValue(l)));
   }
@@ -2778,43 +2776,33 @@ void CodeGenTileLangNPUIRDEV::VpadCodegen(const CallNode *op) {
     high.push_back(CreateIndexCastOp(MakeValue(h)));
   }
   if (!low.empty()) {
-    npuirop.s_low[npuirop.pad_dim] = mlir::ShapedType::kDynamic;
+    npuirop.s_low[npuirop.pad_dim] = ShapedType::kDynamic;
   }
   if (!high.empty()) {
-    npuirop.s_high[npuirop.pad_dim] = mlir::ShapedType::kDynamic;
+    npuirop.s_high[npuirop.pad_dim] = ShapedType::kDynamic;
   }
 
-  llvm::SmallVector<mlir::OpFoldResult> lowFolds;
-  llvm::SmallVector<mlir::OpFoldResult> highFolds;
+  llvm::SmallVector<OpFoldResult> lowFolds;
+  llvm::SmallVector<OpFoldResult> highFolds;
   size_t dyn_low_idx = 0;
   size_t dyn_high_idx = 0;
-  for (size_t i = 0; i < npuirop.s_low.size(); ++i) {
-    if (npuirop.s_low[i] == mlir::ShapedType::kDynamic) {
-      lowFolds.push_back(low[dyn_low_idx++]);
-    } else {
-      lowFolds.push_back(builder.getIndexAttr(npuirop.s_low[i]));
-    }
+  for(size_t i = 0; i < npuirop.s_low.size(); i++){
+    if(npuirop.s_low[i] == ShapedType::kDynamic) lowFolds.push_back(low[dyn_low_idx++]);
+    else lowFolds.push_back(builder.getIndexAttr(npuirop.s_low[i]));
   }
-  for (size_t i = 0; i < npuirop.s_high.size(); ++i) {
-    if (npuirop.s_high[i] == mlir::ShapedType::kDynamic) {
-      highFolds.push_back(high[dyn_high_idx++]);
-    } else {
-      highFolds.push_back(builder.getIndexAttr(npuirop.s_high[i]));
-    }
+  for(size_t i = 0; i < npuirop.s_high.size(); i++){
+    if(npuirop.s_high[i] == ShapedType::kDynamic) highFolds.push_back(low[dyn_high_idx++]);
+    else highFolds.push_back(builder.getIndexAttr(npuirop.s_high[i]));
   }
 
   auto srcTy = src.getType().cast<mlir::RankedTensorType>();
-  auto resultTy = mlir::tensor::PadOp::inferResultType(
-  srcTy, npuirop.s_low, npuirop.s_high);
+  auto resultTy = mlir::tensor::PadOp::inferResultType(srcTy, npuirop.s_low, npuirop.s_high);
 
   auto padOp = builder.create<mlir::tensor::PadOp>(
-  builder.getUnknownLoc(), resultTy, src, lowFolds, highFolds, pad_value);
-
-  mlir::Value inserted =
-  ReshapeCastAndInsertSlice(padOp.getResult(), dst_ori, npuirop.dst_range);
+      builder.getUnknownLoc(), resultTy, src, lowFolds, highFolds, pad_value);
+  Value inserted = ReshapeCastAndInsertSlice(padOp.getResult(), dst, npuirop.dst_range);
   SetVarValue(npuirop.dst, inserted);
 }
-
 
 void CodeGenTileLangNPUIRDEV::VflipCodegen(const CallNode *op) {
   tvm::tl::NpuirFlip npuirop(op->args, this->vmap);

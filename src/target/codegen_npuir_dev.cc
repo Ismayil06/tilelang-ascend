@@ -2800,8 +2800,7 @@ void CodeGenTileLangNPUIRDEV::VpadCodegen(const CallNode *op) {
 
   auto padOp = builder.create<mlir::tensor::PadOp>(
       builder.getUnknownLoc(), resultTy, src, lowFolds, highFolds, pad_value);
-  Value inserted = ReshapeCastAndInsertSlice(padOp.getResult(), dst, npuirop.dst_range);
-  SetVarValue(npuirop.dst, inserted);
+  SetVarValue(npuirop.dst, padOp.getResult());
 }
 
 void CodeGenTileLangNPUIRDEV::VflipCodegen(const CallNode *op) {

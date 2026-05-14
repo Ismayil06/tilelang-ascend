@@ -49,7 +49,7 @@ class LaunchThreadExtractor:
     def extract(self, node: PrimFunc, thread: str):
         self.thread = thread
         self.visit_thread_extent(node)
-        if self.expressions is None:
+        if not self.expressions:
             return None
         return self.expressions[0]
 
@@ -855,7 +855,8 @@ class JitKernel_NPU:
     ):
         if isinstance(out_idx, int):
             out_idx = [out_idx]
-
+        metadata["so_launcher_path"] = kernel_launcher_path
+        metadata["out_idx"] = out_idx
         instance = cls(metadata)
         instance.so_launcher_path = kernel_launcher_path
         instance.so_utils_path = kernel_utils_path
@@ -1284,9 +1285,9 @@ class compiler_npu:
         return mapping.get(dtype_str, torch.float32)
 
     def _parse_grid(self):
-        launcher = LaunchThreadExtractor()
-        expr = launcher.extract(self.mod, "blockIdx.x")
-        self.metadata["gridfunc"] = str(expr)
+        launcher_x = LaunchThreadExtractor()
+        expr_x = launcher_x.extract(self.mod, "blockIdx.x")
+        self.metadata["gridfunc"] = str(expr_x)
 
     def _read_mlir_file(self, file_path) -> str:
         """
